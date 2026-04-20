@@ -1,0 +1,239 @@
+local _, ns = ...
+
+local Addon = ns.Addon
+local Events = Addon:NewModule("Events", "AceEvent-3.0")
+
+-- Internal state
+local castQueue = {}      -- pending casts: { spellId, timestamp }
+local castQueueSize = 0
+
+-- Instance state detection
+function Events:UpdateInstanceState()
+  local _, instanceType = GetInstanceInfo()
+  self.inGroupInstance = (instanceType == "party" or instanceType == "raid")
+end
+
+function Events:IsContentSuppressed()
+  local _, instanceType = GetInstanceInfo()
+  local filters = ns.db.profile.filters
+  if instanceType == "arena" and filters.suppressArena then return true end
+  if instanceType == "pvp" and filters.suppressBG then return true end
+  return false
+end
+
+-- Cast queue management
+function Events:PushCast(spellId)
+  local entry = { spellId = spellId, timestamp = GetTime() }
+  castQueueSize = castQueueSize + 1
+  castQueue[castQueueSize] = entry
+  C_Timer.After(ns.CAST_QUEUE_EXPIRY, function()
+    entry.expired = true
+  end)
+end
+
+function Events:ConsumeBestCast(spellId)
+  for i = castQueueSize, 1, -1 do
+    local entry = castQueue[i]
+    if not entry.expired and not entry.consumed then
+      if entry.spellId == spellId or spellId == nil then
+        entry.consumed = true
+        return entry
+      end
+    end
+  end
+  return nil
+end
+
+-- Cleanup stale cast queue entries periodically
+function Events:CleanCastQueue()
+  local writeIdx = 1
+  for i = 1, castQueueSize do
+    local entry = castQueue[i]
+    if not entry.expired and not entry.consumed then
+      castQueue[writeIdx] = entry
+      writeIdx = writeIdx + 1
+    else
+      castQueue[i] = nil
+    end
+  end
+  castQueueSize = writeIdx - 1
+end
+
+-- Emit a combat event to the display module
+function Events:Emit(eventType, rawValue, school, isCrit)
+  if not ns.db.profile.enabled then return end
+  if self:IsContentSuppressed() then return end
+
+  -- Per-direction toggle check
+  local profile = ns.db.profile
+  if eventType == ns.EVENT_TYPE.OUTGOING_DAMAGE and not profile.outgoing.damage then return end
+  if eventType == ns.EVENT_TYPE.OUTGOING_HEAL and not profile.outgoing.healing then return end
+  if eventType == ns.EVENT_TYPE.INCOMING_DAMAGE and not profile.incoming.damage then return end
+  if eventType == ns.EVENT_TYPE.INCOMING_HEAL and not profile.incoming.healing then return end
+
+  -- Threshold check
+  local threshold
+  if eventType == ns.EVENT_TYPE.OUTGOING_DAMAGE or eventType == ns.EVENT_TYPE.INCOMING_DAMAGE then
+    threshold = ns.db.profile.filters.minDamage
+  else
+    threshold = ns.db.profile.filters.minHealing
+  end
+  if not ns.passesThreshold(rawValue, threshold) then return end
+
+  -- Store raw value in pipe and emit
+  local rawPipeId = ns.allocRawPipe(rawValue)
+  Addon:SendMessage("ZCT_COMBAT_EVENT", {
+    type = eventType,
+    rawPipeId = rawPipeId,
+    school = school or 1,
+    isCrit = isCrit or false,
+    timestamp = GetTime(),
+  })
+end
+
+-- Track the last spell the player cast (for DoT/HoT attribution)
+local lastPlayerSpellId = nil
+local recentPeriodicSpells = {}  -- spellId → timestamp of last cast
+
+-- Event handlers
+
+-- UNIT_COMBAT — handles both player (incoming) and target (secondary outgoing)
+function Events:OnUnitCombat(_, unit, event, flagText, amount, school)
+  local ok, safeAmount = pcall(function() return amount end)
+  if not ok then safeAmount = amount end
+
+  if unit == "player" then
+    -- Incoming damage/healing (always reliable)
+    if event == "WOUND" then
+      local isCrit = (flagText == "CRITICAL")
+      self:Emit(ns.EVENT_TYPE.INCOMING_DAMAGE, safeAmount, school, isCrit)
+    elseif event == "HEAL" then
+      local isCrit = (flagText == "CRITICAL")
+      self:Emit(ns.EVENT_TYPE.INCOMING_HEAL, safeAmount, school, isCrit)
+    end
+  elseif unit == "target" then
+    -- Secondary outgoing (solo/open-world only)
+    -- Skip in group instances (unreliable — shows all damage on target)
+    if self.inGroupInstance then return end
+    if event ~= "WOUND" and event ~= "HEAL" then return end
+
+    -- Require a pending cast match for attribution
+    local match = self:ConsumeBestCast(nil)
+    if not match then return end
+
+    local isCrit = (flagText == "CRITICAL")
+    if event == "WOUND" then
+      self:Emit(ns.EVENT_TYPE.OUTGOING_DAMAGE, safeAmount, school, isCrit)
+    elseif event == "HEAL" then
+      self:Emit(ns.EVENT_TYPE.OUTGOING_HEAL, safeAmount, school, isCrit)
+    end
+  end
+end
+
+-- UNIT_SPELLCAST_SUCCEEDED — build pending cast queue for correlation
+function Events:OnSpellcastSucceeded(_, unit, _, spellId)
+  if unit ~= "player" then return end
+  self:PushCast(spellId)
+  lastPlayerSpellId = spellId
+  recentPeriodicSpells[spellId] = GetTime()
+end
+
+-- COMBAT_TEXT_UPDATE — primary outgoing damage/healing source
+function Events:OnCombatTextUpdate()
+  local ok, ctType, rawArg1, rawArg2 = pcall(C_CombatText.GetCurrentEventInfo)
+  if not ok or not ctType then return end
+
+  -- Determine event type from combat text type
+  local eventType
+  local isCrit = false
+
+  if ctType == "DAMAGE" then
+    eventType = ns.EVENT_TYPE.OUTGOING_DAMAGE
+  elseif ctType == "DAMAGE_CRIT" then
+    eventType = ns.EVENT_TYPE.OUTGOING_DAMAGE
+    isCrit = true
+  elseif ctType == "HEAL" then
+    eventType = ns.EVENT_TYPE.OUTGOING_HEAL
+  elseif ctType == "HEAL_CRIT" then
+    eventType = ns.EVENT_TYPE.OUTGOING_HEAL
+    isCrit = true
+  elseif ctType == "PERIODIC_DAMAGE" then
+    eventType = ns.EVENT_TYPE.OUTGOING_DAMAGE
+  elseif ctType == "PERIODIC_HEAL" then
+    eventType = ns.EVENT_TYPE.OUTGOING_HEAL
+  else
+    return
+  end
+
+  -- rawArg1 is typically the amount, rawArg2 may be spell ID
+  local amount = rawArg1
+  local ctSpellId = nil
+  if ns.isSafeNumber(rawArg2) then
+    ctSpellId = rawArg2
+  end
+
+  -- Attribution: match against cast queue or recent spells
+  local attributed = false
+  if ctSpellId then
+    local match = self:ConsumeBestCast(ctSpellId)
+    if match then
+      attributed = true
+    elseif lastPlayerSpellId and ctSpellId == lastPlayerSpellId then
+      attributed = true
+    elseif recentPeriodicSpells[ctSpellId] then
+      -- DoT/HoT tick from a spell we cast within the last 30s
+      local castTime = recentPeriodicSpells[ctSpellId]
+      if (GetTime() - castTime) < 30 then
+        attributed = true
+      end
+    end
+  else
+    -- No spell ID available, try consuming any pending cast
+    local match = self:ConsumeBestCast(nil)
+    if match then
+      attributed = true
+    end
+  end
+
+  if not attributed then return end
+
+  -- Get the amount (may be secret)
+  local safeAmount = amount
+  if not safeAmount then return end
+
+  self:Emit(eventType, safeAmount, 1, isCrit)
+end
+
+function Events:OnEnable()
+  self:UpdateInstanceState()
+
+  -- UNIT_COMBAT handles both incoming (player) and secondary outgoing (target)
+  self:RegisterEvent("UNIT_COMBAT", "OnUnitCombat")
+
+  -- Outgoing: cast queue + COMBAT_TEXT_UPDATE correlation
+  self:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED", "OnSpellcastSucceeded")
+  self:RegisterEvent("COMBAT_TEXT_UPDATE", "OnCombatTextUpdate")
+
+  -- Instance state tracking
+  self:RegisterEvent("PLAYER_ENTERING_WORLD", "UpdateInstanceState")
+  self:RegisterEvent("ZONE_CHANGED_NEW_AREA", "UpdateInstanceState")
+
+  -- Periodic cleanup (cast queue + stale periodic spell entries)
+  self.cleanupTicker = C_Timer.NewTicker(5, function()
+    self:CleanCastQueue()
+    -- Clean stale periodic spell entries (older than 30s)
+    local now = GetTime()
+    for spellId, timestamp in pairs(recentPeriodicSpells) do
+      if (now - timestamp) > 30 then
+        recentPeriodicSpells[spellId] = nil
+      end
+    end
+  end)
+end
+
+function Events:OnDisable()
+  if self.cleanupTicker then
+    self.cleanupTicker:Cancel()
+    self.cleanupTicker = nil
+  end
+end

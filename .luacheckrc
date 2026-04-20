@@ -1,6 +1,7 @@
 std = "lua51"
 max_line_length = 100
 codes = true
+self = false
 
 globals = {
   "SlashCmdList",
@@ -15,7 +16,12 @@ read_globals = {
   "Settings",
   "C_Timer",
   "C_CVar",
+  "C_CurveUtil",
+  "C_CombatText",
+  "C_PvP",
   "GetTime",
+  "GetInstanceInfo",
+  "IsActiveBattlefieldArena",
   "UnitName",
   "UnitClass",
   "UnitPower",

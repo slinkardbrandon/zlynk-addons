@@ -174,6 +174,22 @@ Set these after registering the addon on each platform.
 - Frame names: only name frames that need to be accessed globally (most don't)
 - Use `BackdropTemplate` mixin for frames needing backgrounds (post-9.0)
 
+## WoW 12.x (Midnight) API Restrictions
+
+All addons in this repo target the Midnight client (12.0+). The combat API landscape changed drastically in 12.0.0. Code must work within these constraints.
+
+**Full reference:** See [docs/midnight-combat-api.md](docs/midnight-combat-api.md) for complete API documentation, available data sources, secret values patterns, and proven architecture.
+
+**Key constraints:**
+- `COMBAT_LOG_EVENT_UNFILTERED` is gone — do not use
+- Combat values may be "secret" (opaque userdata) — cannot compare or do math, only pass to `SetText()`
+- Threshold filtering on secrets is possible via `C_CurveUtil.GetCurveValueAtPoint()` step curves
+- `UNIT_COMBAT("target")` leaks all damage on target, not just yours — requires cast correlation for attribution
+- `COMBAT_TEXT_UPDATE` + `C_CombatText.GetCurrentEventInfo()` is the primary outgoing source (matched against pending cast queue)
+- `UNIT_COMBAT("player")` is reliable for incoming damage
+- Instance/PvP detection APIs (`GetInstanceInfo`, `IsActiveBattlefieldArena`, `C_PvP.IsBattleground`) work normally
+- All combat value access must be pcall-wrapped
+
 ## Shared Libraries (packages/zlynk-lib)
 
 Shared Lua utilities live in `packages/zlynk-lib/src/`. On `pnpm build`, these are copied into each addon's `vendor/` directory. This allows code sharing without WoW addon dependencies.
