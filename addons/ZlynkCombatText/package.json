@@ -1,0 +1,9 @@
+{
+  "name": "@zlynk/combat-text",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "lint": "luacheck . --config ../../.luacheckrc",
+    "build": "bash ../../scripts/build-addon.sh ZlynkCombatText"
+  }
+}

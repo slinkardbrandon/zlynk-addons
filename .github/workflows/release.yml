@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "**"
+
+jobs:
+  detect:
+    name: Detect addon from tag
+    runs-on: ubuntu-latest
+    outputs:
+      addon: ${{ steps.parse.outputs.addon }}
+      pkgmeta: ${{ steps.parse.outputs.pkgmeta }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse tag
+        id: parse
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # Tags follow pattern: addonname-v1.0.0
+          # e.g., zlynkcombattext-v1.0.0 -> ZlynkCombatText
+          ADDON_LOWER="${TAG%%-v*}"
+
+          # Find matching addon directory (case-insensitive)
+          for dir in addons/*/; do
+            dir_lower=$(basename "$dir" | tr '[:upper:]' '[:lower:]')
+            if [[ "$dir_lower" == "$ADDON_LOWER" ]]; then
+              ADDON=$(basename "$dir")
+              break
+            fi
+          done
+
+          if [[ -z "${ADDON:-}" ]]; then
+            echo "No addon found matching tag prefix: $ADDON_LOWER"
+            exit 1
+          fi
+
+          echo "addon=$ADDON" >> "$GITHUB_OUTPUT"
+          echo "pkgmeta=addons/$ADDON/.pkgmeta" >> "$GITHUB_OUTPUT"
+          echo "Releasing $ADDON from tag $TAG"
+
+  release:
+    name: Package & Publish
+    runs-on: ubuntu-latest
+    needs: [detect]
+    concurrency:
+      group: release-${{ needs.detect.outputs.addon }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Package and release
+        uses: BigWigsMods/packager@v2
+        with:
+          args: -m ${{ needs.detect.outputs.pkgmeta }}
+        env:
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+          WAGO_API_TOKEN: ${{ secrets.WAGO_API_TOKEN }}
+          GITHUB_OAUTH: ${{ secrets.GITHUB_TOKEN }}

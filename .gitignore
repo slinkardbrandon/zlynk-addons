@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+libs/
+**/libs
+.tmp-libs/
+
+# Build artifacts
+vendor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Turbo
+.turbo/
+
+# Editor
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Env
+.env
+.env.local
