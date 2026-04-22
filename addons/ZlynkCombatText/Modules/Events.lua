@@ -44,6 +44,25 @@ function Events:ConsumeBestCast(spellId)
   return nil
 end
 
+-- Like ConsumeBestCast but only consumes if the most recent candidate is
+-- within `maxAge` seconds. Used by the pet/player disambiguation path —
+-- walking the queue from newest to oldest, so the first candidate too old
+-- implies every older candidate is too old as well.
+function Events:ConsumeBestCastWithinWindow(maxAge)
+  local now = GetTime()
+  for i = castQueueSize, 1, -1 do
+    local entry = castQueue[i]
+    if not entry.expired and not entry.consumed then
+      if (now - entry.timestamp) > maxAge then
+        return nil
+      end
+      entry.consumed = true
+      return entry
+    end
+  end
+  return nil
+end
+
 -- Cleanup stale cast queue entries periodically
 function Events:CleanCastQueue()
   local writeIdx = 1
@@ -70,13 +89,15 @@ function Events:Emit(eventType, rawValue, school, isCrit)
   if eventType == ns.EVENT_TYPE.OUTGOING_HEAL and not profile.outgoing.healing then return end
   if eventType == ns.EVENT_TYPE.INCOMING_DAMAGE and not profile.incoming.damage then return end
   if eventType == ns.EVENT_TYPE.INCOMING_HEAL and not profile.incoming.healing then return end
+  if eventType == ns.EVENT_TYPE.PET_DAMAGE and not profile.outgoing.pet then return end
+  if eventType == ns.EVENT_TYPE.PET_INCOMING_DAMAGE and not profile.incoming.pet then return end
 
   -- Threshold check
   local threshold
-  if eventType == ns.EVENT_TYPE.OUTGOING_DAMAGE or eventType == ns.EVENT_TYPE.INCOMING_DAMAGE then
-    threshold = ns.db.profile.filters.minDamage
-  else
+  if eventType == ns.EVENT_TYPE.OUTGOING_HEAL or eventType == ns.EVENT_TYPE.INCOMING_HEAL then
     threshold = ns.db.profile.filters.minHealing
+  else
+    threshold = ns.db.profile.filters.minDamage
   end
   if not ns.passesThreshold(rawValue, threshold) then return end
 
@@ -95,38 +116,111 @@ end
 local lastPlayerSpellId = nil
 local recentPeriodicSpells = {}  -- spellId → timestamp of last cast
 
+-- Is the player's pet currently in combat? Gates pet-damage inference so we
+-- don't attribute random leaked target damage to a non-existent pet.
+local function isPetInCombat()
+  if type(UnitExists) ~= "function" or type(UnitAffectingCombat) ~= "function" then
+    return false
+  end
+  local okEx, hasPet = pcall(UnitExists, "pet")
+  if not okEx or not hasPet then return false end
+  local okCombat, inCombat = pcall(UnitAffectingCombat, "pet")
+  return okCombat and inCombat == true
+end
+
+-- Does the target currently have a debuff matching the given spell ID? Used
+-- to decide whether a magic WOUND event on target is a tick from that DoT.
+-- Without this check, any recent non-periodic cast (e.g. Shadow Bolt) could
+-- "stick" as the attributed spell for unrelated magic WOUND events.
+local function hasTargetDebuffSpellId(spellId)
+  if type(spellId) ~= "number" then return false end
+  if not AuraUtil or type(AuraUtil.FindAuraBySpellId) ~= "function" then
+    return false
+  end
+  local ok, aura = pcall(AuraUtil.FindAuraBySpellId, spellId, "target", "HARMFUL")
+  return ok and aura ~= nil
+end
+
+-- Pick the most-recent recently-cast periodic spell whose debuff is still on
+-- target. Returns nil when no cached periodic cast fits.
+local function mostRecentActiveDotSpellId()
+  local now = GetTime()
+  local bestId, bestAt
+  for spellId, castedAt in pairs(recentPeriodicSpells) do
+    if (now - castedAt) <= ns.PERIODIC_OUTGOING_WINDOW then
+      if (not bestAt) or castedAt > bestAt then
+        bestAt = castedAt
+        bestId = spellId
+      end
+    end
+  end
+  if bestId and hasTargetDebuffSpellId(bestId) then
+    return bestId
+  end
+  return nil
+end
+
 -- Event handlers
 
--- UNIT_COMBAT — handles both player (incoming) and target (secondary outgoing)
+-- UNIT_COMBAT — handles player (incoming), target (outgoing attribution),
+-- and pet (pet-received damage).
 function Events:OnUnitCombat(_, unit, event, flagText, amount, school)
   local ok, safeAmount = pcall(function() return amount end)
   if not ok then safeAmount = amount end
 
+  local isCrit = (flagText == "CRITICAL")
+  local isPhysical = ns.isSafeNumber(school) and school == 1
+
   if unit == "player" then
     -- Incoming damage/healing (always reliable)
     if event == "WOUND" then
-      local isCrit = (flagText == "CRITICAL")
       self:Emit(ns.EVENT_TYPE.INCOMING_DAMAGE, safeAmount, school, isCrit)
     elseif event == "HEAL" then
-      local isCrit = (flagText == "CRITICAL")
       self:Emit(ns.EVENT_TYPE.INCOMING_HEAL, safeAmount, school, isCrit)
     end
-  elseif unit == "target" then
-    -- Secondary outgoing (solo/open-world only)
-    -- Skip in group instances (unreliable — shows all damage on target)
-    if self.inGroupInstance then return end
-    if event ~= "WOUND" and event ~= "HEAL" then return end
+    return
+  end
 
-    -- Require a pending cast match for attribution
-    local match = self:ConsumeBestCast(nil)
-    if not match then return end
+  if unit == "pet" then
+    -- Damage taken by the pet
+    if event == "WOUND" then
+      self:Emit(ns.EVENT_TYPE.PET_INCOMING_DAMAGE, safeAmount, school, isCrit)
+    end
+    return
+  end
 
-    local isCrit = (flagText == "CRITICAL")
+  if unit ~= "target" then return end
+
+  -- Skip in group instances (UNIT_COMBAT("target") leaks all damage there)
+  if self.inGroupInstance then return end
+  if event ~= "WOUND" and event ~= "HEAL" then return end
+
+  -- Try to attribute to a recent player cast. Window depends on hit school:
+  -- physical hits are instant; non-physical spells can travel for up to ~2.5s.
+  local window = isPhysical and ns.PLAYER_CAST_WINDOW_PHYSICAL or ns.PLAYER_CAST_WINDOW_MAGIC
+  local match = self:ConsumeBestCastWithinWindow(window)
+
+  if match then
     if event == "WOUND" then
       self:Emit(ns.EVENT_TYPE.OUTGOING_DAMAGE, safeAmount, school, isCrit)
-    elseif event == "HEAL" then
+    else
       self:Emit(ns.EVENT_TYPE.OUTGOING_HEAL, safeAmount, school, isCrit)
     end
+    return
+  end
+
+  -- No recent cast match. For non-physical WOUND, check whether this looks
+  -- like a DoT tick from a recently-cast periodic whose debuff is live.
+  if event == "WOUND" and not isPhysical and mostRecentActiveDotSpellId() then
+    self:Emit(ns.EVENT_TYPE.OUTGOING_DAMAGE, safeAmount, school, isCrit)
+    return
+  end
+
+  -- Fall through: if the pet is in combat, treat unattributed WOUND as pet
+  -- damage. HEAL events without cast attribution are dropped — pet heals on
+  -- the player's target are rare and tend to be false positives.
+  if event == "WOUND" and isPetInCombat() then
+    self:Emit(ns.EVENT_TYPE.PET_DAMAGE, safeAmount, school, isCrit)
   end
 end
 

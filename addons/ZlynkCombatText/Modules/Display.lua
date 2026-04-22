@@ -26,6 +26,10 @@ local function GetEventColor(event)
     return isCrit and colors.incomingCrit or colors.incomingDamage
   elseif eventType == ns.EVENT_TYPE.INCOMING_HEAL then
     return isCrit and colors.incomingHealCrit or colors.incomingHealing
+  elseif eventType == ns.EVENT_TYPE.PET_DAMAGE then
+    return isCrit and colors.petCrit or colors.petDamage
+  elseif eventType == ns.EVENT_TYPE.PET_INCOMING_DAMAGE then
+    return colors.petIncomingDamage
   end
 
   return { 1, 1, 1, 1 }
@@ -108,9 +112,15 @@ local function GetSpawnPosition(event)
   local now = GetTime()
   local baseX, baseY
 
-  -- Anchor relative to screen center (near character)
-  -- Outgoing: right side, Incoming: left side
-  if event.type == ns.EVENT_TYPE.OUTGOING_DAMAGE or event.type == ns.EVENT_TYPE.OUTGOING_HEAL then
+  -- Anchor relative to screen center (near character).
+  -- Outgoing (including pet outgoing): right side. Incoming + pet incoming: left.
+  local t = event.type
+  local isOutgoingSide = (
+    t == ns.EVENT_TYPE.OUTGOING_DAMAGE
+    or t == ns.EVENT_TYPE.OUTGOING_HEAL
+    or t == ns.EVENT_TYPE.PET_DAMAGE
+  )
+  if isOutgoingSide then
     baseX = 80 + math.random(-15, 15)
   else
     baseX = -80 + math.random(-15, 15)

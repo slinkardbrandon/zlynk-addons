@@ -29,7 +29,7 @@ function Addon:SlashCommand(input)
   input = strtrim(input or "")
 
   if input == "" or input == "config" or input == "options" then
-    Settings.OpenToCategory("Zlynk Combat Text")
+    Settings.OpenToCategory(ns.optionsCategoryID)
   elseif input == "help" then
     self:Print("Commands:")
     self:Print("  /zlynk - Open settings")

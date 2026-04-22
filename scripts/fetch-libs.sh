@@ -47,8 +47,41 @@ if $needs_fetch; then
 
   rm -rf "$TMP_DIR"
 else
-  echo "  All libs already present, skipping"
+  echo "  All Ace3 libs already present, skipping"
 fi
+
+# Standalone libraries fetched directly from their own GitHub repos.
+# Format: "<target-dir-name>|<git-url>"
+# Note: LibSharedMedia-3.0 has no official GitHub mirror; Rockleonzo/LibSharedMedia
+# is the most reliable public copy. CI/release builds use the canonical wowace
+# SVN via the BigWigsMods/packager action (see .pkgmeta), so this only needs to
+# be accurate enough to develop against locally.
+EXTRA_LIBS=(
+  "LibSharedMedia-3.0|https://github.com/Rockleonzo/LibSharedMedia.git"
+  "LibSerialize|https://github.com/rossnichols/LibSerialize.git"
+  "LibDeflate|https://github.com/SafeteeWoW/LibDeflate.git"
+)
+
+echo "Fetching standalone libraries ..."
+for entry in "${EXTRA_LIBS[@]}"; do
+  dir_name="${entry%%|*}"
+  git_url="${entry##*|}"
+  target="$LIBS_DIR/$dir_name"
+
+  if [[ -d "$target" ]]; then
+    echo "  $dir_name (exists, skipping)"
+    continue
+  fi
+
+  tmp_clone="$TMP_DIR/$dir_name"
+  rm -rf "$tmp_clone"
+  mkdir -p "$TMP_DIR"
+  git clone --depth 1 --quiet "$git_url" "$tmp_clone"
+  rm -rf "$tmp_clone/.git"
+  mv "$tmp_clone" "$target"
+  echo "  $dir_name"
+done
+rm -rf "$TMP_DIR"
 
 # Symlink libs into each addon
 for addon_dir in "$REPO_ROOT"/addons/*/; do

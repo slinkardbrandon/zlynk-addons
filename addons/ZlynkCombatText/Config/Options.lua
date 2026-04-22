@@ -153,6 +153,17 @@ local function GetOptions()
               ns.db.profile.outgoing.healing = val
             end,
           },
+          outPet = {
+            name = "Pet Damage",
+            desc = "Show damage dealt by your pet (inferred — see Filters)",
+            type = "toggle",
+            order = 4,
+            width = "full",
+            get = function() return ns.db.profile.outgoing.pet end,
+            set = function(_, val)
+              ns.db.profile.outgoing.pet = val
+            end,
+          },
           header_incoming = {
             name = "Incoming",
             type = "header",
@@ -178,6 +189,17 @@ local function GetOptions()
             get = function() return ns.db.profile.incoming.healing end,
             set = function(_, val)
               ns.db.profile.incoming.healing = val
+            end,
+          },
+          incPet = {
+            name = "Pet Damage Taken",
+            desc = "Show damage your pet takes",
+            type = "toggle",
+            order = 13,
+            width = "full",
+            get = function() return ns.db.profile.incoming.pet end,
+            set = function(_, val)
+              ns.db.profile.incoming.pet = val
             end,
           },
         },
@@ -301,6 +323,50 @@ local function GetOptions()
               ns.db.profile.colors.incomingHealCrit = { r, g, b, a }
             end,
           },
+          header_pet = {
+            name = "Pet",
+            type = "header",
+            order = 20,
+          },
+          petDamage = {
+            name = "Pet Damage",
+            type = "color",
+            order = 21,
+            hasAlpha = true,
+            get = function()
+              local c = ns.db.profile.colors.petDamage
+              return c[1], c[2], c[3], c[4]
+            end,
+            set = function(_, r, g, b, a)
+              ns.db.profile.colors.petDamage = { r, g, b, a }
+            end,
+          },
+          petCrit = {
+            name = "Pet Damage (Critical)",
+            type = "color",
+            order = 22,
+            hasAlpha = true,
+            get = function()
+              local c = ns.db.profile.colors.petCrit
+              return c[1], c[2], c[3], c[4]
+            end,
+            set = function(_, r, g, b, a)
+              ns.db.profile.colors.petCrit = { r, g, b, a }
+            end,
+          },
+          petIncomingDamage = {
+            name = "Pet Damage Taken",
+            type = "color",
+            order = 23,
+            hasAlpha = true,
+            get = function()
+              local c = ns.db.profile.colors.petIncomingDamage
+              return c[1], c[2], c[3], c[4]
+            end,
+            set = function(_, r, g, b, a)
+              ns.db.profile.colors.petIncomingDamage = { r, g, b, a }
+            end,
+          },
         },
       },
       filters = {
@@ -388,5 +454,9 @@ function ns.RegisterOptions(addon)
   options.args.importExport = ns.GetImportExportOptions()
 
   LibStub("AceConfig-3.0"):RegisterOptionsTable("ZlynkCombatText", options)
-  LibStub("AceConfigDialog-3.0"):AddToBlizOptions("ZlynkCombatText", "Zlynk Combat Text")
+  local _, categoryID = LibStub("AceConfigDialog-3.0"):AddToBlizOptions(
+    "ZlynkCombatText",
+    "Zlynk Combat Text"
+  )
+  ns.optionsCategoryID = categoryID
 end

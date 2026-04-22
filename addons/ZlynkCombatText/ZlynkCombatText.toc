@@ -1,4 +1,4 @@
-## Interface: 120001
+## Interface: 120005
 ## Title: Zlynk Combat Text
 ## Notes: Lightweight floating combat text with clean aesthetics.
 ## Author: Zlynk

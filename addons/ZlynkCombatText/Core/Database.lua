@@ -11,10 +11,12 @@ ns.defaults = {
     outgoing = {
       damage = true,
       healing = true,
+      pet = true,
     },
     incoming = {
       damage = true,
       healing = true,
+      pet = true,
     },
     colors = {
       outgoingDamage = { 1, 1, 1, 1 },
@@ -25,6 +27,9 @@ ns.defaults = {
       incomingCrit = { 1, 0.0, 0.0, 1 },
       incomingHealing = { 0.1, 0.8, 0.1, 1 },
       incomingHealCrit = { 0.1, 1, 0.5, 1 },
+      petDamage = { 0.8, 0.85, 1, 1 },
+      petCrit = { 1, 0.85, 0.3, 1 },
+      petIncomingDamage = { 1, 0.5, 0.5, 1 },
     },
     animation = {
       duration = 1.5,

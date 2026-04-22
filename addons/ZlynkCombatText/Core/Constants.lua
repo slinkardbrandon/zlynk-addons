@@ -6,6 +6,8 @@ ns.EVENT_TYPE = {
   OUTGOING_HEAL = 2,
   INCOMING_DAMAGE = 3,
   INCOMING_HEAL = 4,
+  PET_DAMAGE = 5,
+  PET_INCOMING_DAMAGE = 6,
 }
 
 -- Damage school colors (schoolMask bit → RGBA)
@@ -75,5 +77,16 @@ function ns.passesThreshold(rawValue, threshold)
   return true
 end
 
--- Cast queue expiry time (seconds)
-ns.CAST_QUEUE_EXPIRY = 0.85
+-- Cast queue expiry time (seconds). Covers the longest attribution window we
+-- use (non-physical projectile travel), not just the tight physical window.
+ns.CAST_QUEUE_EXPIRY = 3.0
+
+-- Attribution windows for UNIT_COMBAT("target") → player vs pet inference.
+-- If a player cast succeeded within this window, the hit is attributed to
+-- the player; otherwise it falls through to pet/DoT checks.
+ns.PLAYER_CAST_WINDOW_PHYSICAL = 0.7
+ns.PLAYER_CAST_WINDOW_MAGIC = 2.5
+
+-- Periodic (DoT) tick attribution window — how long after a cast we still
+-- treat a magic WOUND event on target as a DoT tick from that cast.
+ns.PERIODIC_OUTGOING_WINDOW = 30.0
