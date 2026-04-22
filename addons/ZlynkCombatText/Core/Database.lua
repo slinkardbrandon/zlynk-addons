@@ -1,46 +1,58 @@
 local _, ns = ...
 
+-- TODO: healing + shields + absorbs. Intentionally out of scope for now.
+-- Damage-only until the attribution/display pipeline is solid.
+
 ns.defaults = {
+  global = {
+    -- Diagnostic trace log. Populated by /zlynk trace start. Persists across
+    -- reloads (saved to ZlynkCombatTextDB.lua) so the user can capture a
+    -- session, /reload, and paste the results.
+    traceLog = nil,
+  },
   profile = {
     enabled = true,
     font = {
       name = "Friz Quadrata TT",
-      size = 24,
-      flags = "OUTLINE",
+      size = 28,
+      flags = "THICKOUTLINE",
     },
     outgoing = {
       damage = true,
-      healing = true,
       pet = true,
     },
     incoming = {
       damage = true,
-      healing = true,
       pet = true,
     },
     colors = {
       outgoingDamage = { 1, 1, 1, 1 },
-      outgoingCrit = { 1, 0.8, 0, 1 },
-      outgoingHealing = { 0.1, 1, 0.1, 1 },
-      outgoingHealCrit = { 0.1, 1, 0.5, 1 },
-      incomingDamage = { 1, 0.2, 0.2, 1 },
-      incomingCrit = { 1, 0.0, 0.0, 1 },
-      incomingHealing = { 0.1, 0.8, 0.1, 1 },
-      incomingHealCrit = { 0.1, 1, 0.5, 1 },
-      petDamage = { 0.8, 0.85, 1, 1 },
-      petCrit = { 1, 0.85, 0.3, 1 },
-      petIncomingDamage = { 1, 0.5, 0.5, 1 },
+      outgoingCrit = { 1, 0.85, 0, 1 },
+      incomingDamage = { 1, 0.25, 0.25, 1 },
+      incomingCrit = { 1, 0.05, 0.05, 1 },
+      petDamage = { 1, 0.6, 0.15, 1 },
+      petCrit = { 1, 0.75, 0.1, 1 },
+      petIncomingDamage = { 0.9, 0.4, 0.4, 1 },
     },
     animation = {
-      duration = 1.5,
-      distance = 80,
-      critScale = 1.5,
+      duration = 1.6,
+      distance = 90,
+      critScale = 1.8,
+      spreadX = 40,
+    },
+    merging = {
+      enabled = true,
+      window = 0.3,
+      maxPerAnchor = 5,
     },
     filters = {
       minDamage = 0,
-      minHealing = 0,
-      suppressArena = false,
-      suppressBG = false,
+      -- PvP instances default to suppressed. UNIT_COMBAT has no source
+      -- attribution in Midnight, so heavy group content (arena + BG) leaks
+      -- ally/enemy damage as yours. PvE content is fine; suppression is
+      -- off by default there.
+      suppressArena = true,
+      suppressBG = true,
     },
   },
 }

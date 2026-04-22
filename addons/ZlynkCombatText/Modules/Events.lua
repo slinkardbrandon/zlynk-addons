@@ -3,105 +3,278 @@ local _, ns = ...
 local Addon = ns.Addon
 local Events = Addon:NewModule("Events", "AceEvent-3.0")
 
--- Internal state
-local castQueue = {}      -- pending casts: { spellId, timestamp }
-local castQueueSize = 0
+-- TODO: healing / shields / absorbs. Damage-only for now.
 
--- Instance state detection
-function Events:UpdateInstanceState()
-  local _, instanceType = GetInstanceInfo()
-  self.inGroupInstance = (instanceType == "party" or instanceType == "raid")
+-- ============================================================================
+-- Diagnostic trace
+-- ============================================================================
+-- Records raw event fires so we can diagnose future pipeline issues.
+-- Stored under db.global.traceLog = { active, startedAt, entries = {...} },
+-- persisted across /reload via SavedVariables. Capped at 2000 entries.
+
+local TRACE_CAP = 2000
+
+local function isTraceActive()
+  return ns.db and ns.db.global
+    and ns.db.global.traceLog
+    and ns.db.global.traceLog.active == true
 end
 
-function Events:IsContentSuppressed()
-  local _, instanceType = GetInstanceInfo()
-  local filters = ns.db.profile.filters
-  if instanceType == "arena" and filters.suppressArena then return true end
-  if instanceType == "pvp" and filters.suppressBG then return true end
+local function trace(entry)
+  if not isTraceActive() then return end
+  local log = ns.db.global.traceLog
+  local entries = log.entries
+  if #entries >= TRACE_CAP then return end
+  entry.t = GetTime() - (log.startedAt or 0)
+  entries[#entries + 1] = entry
+end
+
+local function safeGUID(unit)
+  if type(UnitGUID) ~= "function" then return nil end
+  local ok, g = pcall(UnitGUID, unit)
+  if ok and type(g) == "string" and g ~= "" then return g end
+  return nil
+end
+
+local function safeName(unit)
+  if type(UnitName) ~= "function" then return nil end
+  local ok, n = pcall(UnitName, unit)
+  if ok and type(n) == "string" and n ~= "" then return n end
+  return nil
+end
+
+-- ============================================================================
+-- Engagement and attribution state
+-- ============================================================================
+--
+-- A hit renders only if BOTH gates pass:
+--
+--   Engagement gate — "is this a mob we're actually fighting?"
+--     A GUID is engaged when one of the following happens:
+--       - Player SENT on a context token (target/focus/mouseover) that matches
+--         the cast's target name → that token's GUID is engaged
+--       - Pet SUCCEEDED → pettarget + target GUIDs are engaged
+--       - pettarget poll (200ms) → the current pettarget GUID is engaged
+--     Lifetime: 30s in solo (covers DoT duration), 2.5s in group (prevents
+--     ally-damage leak on shared mobs; UNIT_COMBAT has no source attribution).
+--
+--   Attribution gate — "on engaged mobs, which hits are actually ours?"
+--     A hit is attributed when:
+--       (1) A player cast succeeded inside the school-appropriate window
+--       (2) A pet cast succeeded inside the magic-cast window
+--       (3) One of our recent periodic spells has a debuff on the victim
+--           (solo only — catches DoT ticks past the direct-cast window)
+--       (4) A physical hit + pet in combat + GUID recently seen as pettarget
+--           (solo only — catches pet auto-attacks, no cast event exists)
+--
+-- Dropping cases: anything on a non-engaged GUID (prevents stranger damage on
+-- untouched mobs), and engaged hits that match none of (1)-(4) (prevents
+-- stranger damage on our engaged mobs during dead-air moments).
+
+local engaged = {}               -- guid → engageTime
+local lastPlayerCastAt = 0
+local lastPlayerCastSpellId = nil
+local lastPlayerCastSchool = nil -- Learned from the first UNIT_COMBAT hit that
+                                 -- `playerCastRecent` claims. Subsequent hits
+                                 -- in the same window must match this school
+                                 -- or they're treated as someone else's.
+local lastPetCastAt = 0
+local recentPlayerSpells = {}    -- spellId → castAt
+local spellIdSchools = {}        -- spellId → school (learned over time)
+local recentPetTargets = {}      -- guid → snapshot-time
+
+local PERIODIC_DEBUFF_WINDOW = 30.0  -- Cover the longest DoT we might place
+local PET_TARGET_WINDOW = 5.0        -- Pet-auto inference window
+
+local function engagementWindow()
+  if type(IsInGroup) == "function" and IsInGroup() then
+    return ns.ENGAGEMENT_WINDOW_GROUP
+  end
+  return ns.ENGAGEMENT_WINDOW_SOLO
+end
+
+local function engageGUID(guid, now)
+  if not guid then return end
+  engaged[guid] = now or GetTime()
+end
+
+local function isEngaged(guid)
+  if not guid then return false end
+  local at = engaged[guid]
+  if not at then return false end
+  local age = GetTime() - at
+  if age > engagementWindow() then
+    engaged[guid] = nil
+    return false
+  end
+  return true
+end
+
+local function recordPlayerCast(spellId)
+  lastPlayerCastAt = GetTime()
+  lastPlayerCastSpellId = spellId
+  -- Clear the learned school for this cast; the first attributed hit after
+  -- this cast will set it (and we'll also cache it by spellId).
+  lastPlayerCastSchool = nil
+  if type(spellId) == "number" then
+    recentPlayerSpells[spellId] = lastPlayerCastAt
+  end
+end
+
+local function recordPetCast()
+  lastPetCastAt = GetTime()
+  local now = lastPetCastAt
+  local petTargetGuid = safeGUID("pettarget")
+  local targetGuid = safeGUID("target")
+  if petTargetGuid then
+    recentPetTargets[petTargetGuid] = now
+    engageGUID(petTargetGuid, now)
+  end
+  if targetGuid then
+    recentPetTargets[targetGuid] = now
+    engageGUID(targetGuid, now)
+  end
+end
+
+local function playerCastRecent(school, now)
+  if lastPlayerCastAt == 0 then return false end
+  local isPhysical = ns.isSafeNumber(school) and school == 1
+  local window = isPhysical
+    and ns.PLAYER_CAST_WINDOW_PHYSICAL
+    or ns.PLAYER_CAST_WINDOW_MAGIC
+  if (now - lastPlayerCastAt) > window then return false end
+  -- School must match the cast we did. First hit after a cast learns the
+  -- school (we don't have a direct API for spell school); later hits in the
+  -- window must match. A fresh cast with unknown school first uses cached
+  -- school-by-spellId if we've seen it before.
+  if lastPlayerCastSchool == nil and lastPlayerCastSpellId then
+    lastPlayerCastSchool = spellIdSchools[lastPlayerCastSpellId]
+  end
+  if lastPlayerCastSchool == nil then
+    return true  -- haven't learned yet; the first hit sets it
+  end
+  if not ns.isSafeNumber(school) then return false end
+  return school == lastPlayerCastSchool
+end
+
+local function learnCastSchool(school)
+  if not ns.isSafeNumber(school) then return end
+  if lastPlayerCastSchool == nil then
+    lastPlayerCastSchool = school
+  end
+  if lastPlayerCastSpellId then
+    spellIdSchools[lastPlayerCastSpellId] = school
+  end
+end
+
+local function petCastRecent(now)
+  if lastPetCastAt == 0 then return false end
+  return (now - lastPetCastAt) <= ns.PLAYER_CAST_WINDOW_MAGIC
+end
+
+-- Does this unit carry a debuff from one of OUR recently-cast spells, whose
+-- school matches the incoming hit? Used to catch DoT ticks past the direct-
+-- cast window. School-gating prevents attributing a stranger's hit on a mob
+-- that happens to carry our DoT — their spell likely has a different school.
+local function hasOurRecentDebuff(unitToken, hitSchool)
+  if not AuraUtil or type(AuraUtil.FindAuraBySpellId) ~= "function" then
+    return false
+  end
+  if not ns.isSafeNumber(hitSchool) then return false end
+  local now = GetTime()
+  for spellId, castAt in pairs(recentPlayerSpells) do
+    if (now - castAt) <= PERIODIC_DEBUFF_WINDOW then
+      local spellSchool = spellIdSchools[spellId]
+      -- Only accept when we've learned this spell's school AND it matches.
+      -- If we haven't learned the school yet (pure-DoT cast with no observed
+      -- direct hit), we conservatively skip — better to miss the first tick
+      -- than to attribute a stranger's hit.
+      if spellSchool == hitSchool then
+        local ok, aura = pcall(
+          AuraUtil.FindAuraBySpellId, spellId, unitToken, "HARMFUL|PLAYER"
+        )
+        if ok and aura then return true end
+      end
+    end
+  end
   return false
 end
 
--- Cast queue management
-function Events:PushCast(spellId)
-  local entry = { spellId = spellId, timestamp = GetTime() }
-  castQueueSize = castQueueSize + 1
-  castQueue[castQueueSize] = entry
-  C_Timer.After(ns.CAST_QUEUE_EXPIRY, function()
-    entry.expired = true
-  end)
-end
-
-function Events:ConsumeBestCast(spellId)
-  for i = castQueueSize, 1, -1 do
-    local entry = castQueue[i]
-    if not entry.expired and not entry.consumed then
-      if entry.spellId == spellId or spellId == nil then
-        entry.consumed = true
-        return entry
-      end
-    end
+local function isPetInCombat()
+  if type(UnitExists) ~= "function" or type(UnitAffectingCombat) ~= "function" then
+    return false
   end
-  return nil
+  local okEx, hasPet = pcall(UnitExists, "pet")
+  if not okEx or not hasPet then return false end
+  local okC, inCombat = pcall(UnitAffectingCombat, "pet")
+  return okC and inCombat == true
 end
 
--- Like ConsumeBestCast but only consumes if the most recent candidate is
--- within `maxAge` seconds. Used by the pet/player disambiguation path —
--- walking the queue from newest to oldest, so the first candidate too old
--- implies every older candidate is too old as well.
-function Events:ConsumeBestCastWithinWindow(maxAge)
+local function looksLikePetAuto(guid, school, now)
+  if not guid then return false end
+  if not (ns.isSafeNumber(school) and school == 1) then return false end
+  if not isPetInCombat() then return false end
+  local seenAt = recentPetTargets[guid]
+  if not seenAt then return false end
+  return (now - seenAt) <= PET_TARGET_WINDOW
+end
+
+local function sweepAttributionState()
   local now = GetTime()
-  for i = castQueueSize, 1, -1 do
-    local entry = castQueue[i]
-    if not entry.expired and not entry.consumed then
-      if (now - entry.timestamp) > maxAge then
-        return nil
-      end
-      entry.consumed = true
-      return entry
+  for spellId, castAt in pairs(recentPlayerSpells) do
+    if (now - castAt) > PERIODIC_DEBUFF_WINDOW then
+      recentPlayerSpells[spellId] = nil
     end
   end
-  return nil
-end
-
--- Cleanup stale cast queue entries periodically
-function Events:CleanCastQueue()
-  local writeIdx = 1
-  for i = 1, castQueueSize do
-    local entry = castQueue[i]
-    if not entry.expired and not entry.consumed then
-      castQueue[writeIdx] = entry
-      writeIdx = writeIdx + 1
-    else
-      castQueue[i] = nil
+  for guid, seenAt in pairs(recentPetTargets) do
+    if (now - seenAt) > PET_TARGET_WINDOW * 2 then
+      recentPetTargets[guid] = nil
     end
   end
-  castQueueSize = writeIdx - 1
+  local engWindow = engagementWindow()
+  for guid, engAt in pairs(engaged) do
+    if (now - engAt) > engWindow then
+      engaged[guid] = nil
+    end
+  end
 end
 
--- Emit a combat event to the display module
-function Events:Emit(eventType, rawValue, school, isCrit)
+-- ============================================================================
+-- Instance state
+-- ============================================================================
+
+function Events:UpdateInstanceState()
+  local _, instanceType = GetInstanceInfo()
+  self.instanceType = instanceType
+end
+
+function Events:IsContentSuppressed()
+  local filters = ns.db.profile.filters
+  if self.instanceType == "arena" and filters.suppressArena then return true end
+  if self.instanceType == "pvp" and filters.suppressBG then return true end
+  return false
+end
+
+local function isGroupContent()
+  return type(IsInGroup) == "function" and IsInGroup()
+end
+
+-- ============================================================================
+-- Emit
+-- ============================================================================
+
+function Events:Emit(eventType, anchorUnit, anchorGUID, rawValue, school, isCrit, spellId)
   if not ns.db.profile.enabled then return end
   if self:IsContentSuppressed() then return end
 
-  -- Per-direction toggle check
   local profile = ns.db.profile
   if eventType == ns.EVENT_TYPE.OUTGOING_DAMAGE and not profile.outgoing.damage then return end
-  if eventType == ns.EVENT_TYPE.OUTGOING_HEAL and not profile.outgoing.healing then return end
   if eventType == ns.EVENT_TYPE.INCOMING_DAMAGE and not profile.incoming.damage then return end
-  if eventType == ns.EVENT_TYPE.INCOMING_HEAL and not profile.incoming.healing then return end
   if eventType == ns.EVENT_TYPE.PET_DAMAGE and not profile.outgoing.pet then return end
   if eventType == ns.EVENT_TYPE.PET_INCOMING_DAMAGE and not profile.incoming.pet then return end
 
-  -- Threshold check
-  local threshold
-  if eventType == ns.EVENT_TYPE.OUTGOING_HEAL or eventType == ns.EVENT_TYPE.INCOMING_HEAL then
-    threshold = ns.db.profile.filters.minHealing
-  else
-    threshold = ns.db.profile.filters.minDamage
-  end
-  if not ns.passesThreshold(rawValue, threshold) then return end
+  if not ns.passesThreshold(rawValue, ns.db.profile.filters.minDamage) then return end
 
-  -- Store raw value in pipe and emit
   local rawPipeId = ns.allocRawPipe(rawValue)
   Addon:SendMessage("ZCT_COMBAT_EVENT", {
     type = eventType,
@@ -109,225 +282,231 @@ function Events:Emit(eventType, rawValue, school, isCrit)
     school = school or 1,
     isCrit = isCrit or false,
     timestamp = GetTime(),
+    anchorUnit = anchorUnit,
+    anchorGUID = anchorGUID,
+    spellId = spellId,
   })
 end
 
--- Track the last spell the player cast (for DoT/HoT attribution)
-local lastPlayerSpellId = nil
-local recentPeriodicSpells = {}  -- spellId → timestamp of last cast
+-- ============================================================================
+-- UNIT_COMBAT dispatch
+-- ============================================================================
 
--- Is the player's pet currently in combat? Gates pet-damage inference so we
--- don't attribute random leaked target damage to a non-existent pet.
-local function isPetInCombat()
-  if type(UnitExists) ~= "function" or type(UnitAffectingCombat) ~= "function" then
-    return false
-  end
-  local okEx, hasPet = pcall(UnitExists, "pet")
-  if not okEx or not hasPet then return false end
-  local okCombat, inCombat = pcall(UnitAffectingCombat, "pet")
-  return okCombat and inCombat == true
+local function isNameplateToken(unit)
+  if type(unit) ~= "string" then return false end
+  return unit:match("^nameplate%d+$") ~= nil
 end
 
--- Does the target currently have a debuff matching the given spell ID? Used
--- to decide whether a magic WOUND event on target is a tick from that DoT.
--- Without this check, any recent non-periodic cast (e.g. Shadow Bolt) could
--- "stick" as the attributed spell for unrelated magic WOUND events.
-local function hasTargetDebuffSpellId(spellId)
-  if type(spellId) ~= "number" then return false end
-  if not AuraUtil or type(AuraUtil.FindAuraBySpellId) ~= "function" then
-    return false
+-- Attribution decision. Returns an event type enum or nil (drop).
+local function attribute(unitToken, guid, school, now, groupMode)
+  if playerCastRecent(school, now) then
+    learnCastSchool(school)
+    return ns.EVENT_TYPE.OUTGOING_DAMAGE
   end
-  local ok, aura = pcall(AuraUtil.FindAuraBySpellId, spellId, "target", "HARMFUL")
-  return ok and aura ~= nil
-end
+  if petCastRecent(now) then
+    return ns.EVENT_TYPE.PET_DAMAGE
+  end
 
--- Pick the most-recent recently-cast periodic spell whose debuff is still on
--- target. Returns nil when no cached periodic cast fits.
-local function mostRecentActiveDotSpellId()
-  local now = GetTime()
-  local bestId, bestAt
-  for spellId, castedAt in pairs(recentPeriodicSpells) do
-    if (now - castedAt) <= ns.PERIODIC_OUTGOING_WINDOW then
-      if (not bestAt) or castedAt > bestAt then
-        bestAt = castedAt
-        bestId = spellId
-      end
-    end
+  -- Group mode stops here. Longer windows would attribute ally damage to us,
+  -- since UNIT_COMBAT doesn't carry source info.
+  if groupMode then return nil end
+
+  if hasOurRecentDebuff(unitToken, school) then
+    return ns.EVENT_TYPE.OUTGOING_DAMAGE
   end
-  if bestId and hasTargetDebuffSpellId(bestId) then
-    return bestId
+  if looksLikePetAuto(guid, school, now) then
+    return ns.EVENT_TYPE.PET_DAMAGE
   end
   return nil
 end
 
--- Event handlers
-
--- UNIT_COMBAT — handles player (incoming), target (outgoing attribution),
--- and pet (pet-received damage).
 function Events:OnUnitCombat(_, unit, event, flagText, amount, school)
+  if isTraceActive() then
+    trace({
+      e = "UNIT_COMBAT",
+      unit = unit,
+      guid = safeGUID(unit),
+      name = safeName(unit),
+      event = event,
+      flag = flagText,
+      amount = ns.isSafeNumber(amount) and amount or "<secret>",
+      school = school,
+    })
+  end
+
+  if event ~= "WOUND" then return end  -- damage-only for now
+
+  local isCrit = (flagText == "CRITICAL")
+
   local ok, safeAmount = pcall(function() return amount end)
   if not ok then safeAmount = amount end
 
-  local isCrit = (flagText == "CRITICAL")
-  local isPhysical = ns.isSafeNumber(school) and school == 1
-
   if unit == "player" then
-    -- Incoming damage/healing (always reliable)
-    if event == "WOUND" then
-      self:Emit(ns.EVENT_TYPE.INCOMING_DAMAGE, safeAmount, school, isCrit)
-    elseif event == "HEAL" then
-      self:Emit(ns.EVENT_TYPE.INCOMING_HEAL, safeAmount, school, isCrit)
-    end
+    self:Emit(ns.EVENT_TYPE.INCOMING_DAMAGE, "player", safeGUID("player"),
+      safeAmount, school, isCrit, nil)
     return
   end
-
   if unit == "pet" then
-    -- Damage taken by the pet
-    if event == "WOUND" then
-      self:Emit(ns.EVENT_TYPE.PET_INCOMING_DAMAGE, safeAmount, school, isCrit)
-    end
+    self:Emit(ns.EVENT_TYPE.PET_INCOMING_DAMAGE, "pet", safeGUID("pet"),
+      safeAmount, school, isCrit, nil)
     return
   end
 
-  if unit ~= "target" then return end
+  if not isNameplateToken(unit) then return end
 
-  -- Skip in group instances (UNIT_COMBAT("target") leaks all damage there)
-  if self.inGroupInstance then return end
-  if event ~= "WOUND" and event ~= "HEAL" then return end
+  local guid = safeGUID(unit)
+  if not guid then return end
 
-  -- Try to attribute to a recent player cast. Window depends on hit school:
-  -- physical hits are instant; non-physical spells can travel for up to ~2.5s.
-  local window = isPhysical and ns.PLAYER_CAST_WINDOW_PHYSICAL or ns.PLAYER_CAST_WINDOW_MAGIC
-  local match = self:ConsumeBestCastWithinWindow(window)
+  -- Engagement gate: only hits on mobs we've attacked are eligible. Without
+  -- this, any cast window would temporarily attribute every nearby mob's
+  -- damage (from other players) to us.
+  if not isEngaged(guid) then return end
 
-  if match then
-    if event == "WOUND" then
-      self:Emit(ns.EVENT_TYPE.OUTGOING_DAMAGE, safeAmount, school, isCrit)
-    else
-      self:Emit(ns.EVENT_TYPE.OUTGOING_HEAL, safeAmount, school, isCrit)
-    end
-    return
-  end
+  local now = GetTime()
+  local eventType = attribute(unit, guid, school, now, isGroupContent())
+  if not eventType then return end
 
-  -- No recent cast match. For non-physical WOUND, check whether this looks
-  -- like a DoT tick from a recently-cast periodic whose debuff is live.
-  if event == "WOUND" and not isPhysical and mostRecentActiveDotSpellId() then
-    self:Emit(ns.EVENT_TYPE.OUTGOING_DAMAGE, safeAmount, school, isCrit)
-    return
-  end
+  -- Re-engage on attributed hit to keep the mob hot through long fights.
+  engageGUID(guid, now)
 
-  -- Fall through: if the pet is in combat, treat unattributed WOUND as pet
-  -- damage. HEAL events without cast attribution are dropped — pet heals on
-  -- the player's target are rare and tend to be false positives.
-  if event == "WOUND" and isPetInCombat() then
-    self:Emit(ns.EVENT_TYPE.PET_DAMAGE, safeAmount, school, isCrit)
-  end
+  self:Emit(eventType, unit, guid, safeAmount, school, isCrit, nil)
 end
 
--- UNIT_SPELLCAST_SUCCEEDED — build pending cast queue for correlation
-function Events:OnSpellcastSucceeded(_, unit, _, spellId)
-  if unit ~= "player" then return end
-  self:PushCast(spellId)
-  lastPlayerSpellId = spellId
-  recentPeriodicSpells[spellId] = GetTime()
-end
+-- ============================================================================
+-- Cast signals
+-- ============================================================================
 
--- COMBAT_TEXT_UPDATE — primary outgoing damage/healing source
-function Events:OnCombatTextUpdate()
-  local ok, ctType, rawArg1, rawArg2 = pcall(C_CombatText.GetCurrentEventInfo)
-  if not ok or not ctType then return end
-
-  -- Determine event type from combat text type
-  local eventType
-  local isCrit = false
-
-  if ctType == "DAMAGE" then
-    eventType = ns.EVENT_TYPE.OUTGOING_DAMAGE
-  elseif ctType == "DAMAGE_CRIT" then
-    eventType = ns.EVENT_TYPE.OUTGOING_DAMAGE
-    isCrit = true
-  elseif ctType == "HEAL" then
-    eventType = ns.EVENT_TYPE.OUTGOING_HEAL
-  elseif ctType == "HEAL_CRIT" then
-    eventType = ns.EVENT_TYPE.OUTGOING_HEAL
-    isCrit = true
-  elseif ctType == "PERIODIC_DAMAGE" then
-    eventType = ns.EVENT_TYPE.OUTGOING_DAMAGE
-  elseif ctType == "PERIODIC_HEAL" then
-    eventType = ns.EVENT_TYPE.OUTGOING_HEAL
-  else
-    return
-  end
-
-  -- rawArg1 is typically the amount, rawArg2 may be spell ID
-  local amount = rawArg1
-  local ctSpellId = nil
-  if ns.isSafeNumber(rawArg2) then
-    ctSpellId = rawArg2
-  end
-
-  -- Attribution: match against cast queue or recent spells
-  local attributed = false
-  if ctSpellId then
-    local match = self:ConsumeBestCast(ctSpellId)
-    if match then
-      attributed = true
-    elseif lastPlayerSpellId and ctSpellId == lastPlayerSpellId then
-      attributed = true
-    elseif recentPeriodicSpells[ctSpellId] then
-      -- DoT/HoT tick from a spell we cast within the last 30s
-      local castTime = recentPeriodicSpells[ctSpellId]
-      if (GetTime() - castTime) < 30 then
-        attributed = true
+function Events:OnSpellcastSent(_, unit, targetName, castGUID, spellId)
+  if isTraceActive() then
+    local context = {}
+    for _, tok in ipairs({ "target", "focus", "mouseover", "pettarget" }) do
+      local n = safeName(tok)
+      if n then
+        context[tok] = { name = n, guid = safeGUID(tok), matches = (n == targetName) }
       end
     end
-  else
-    -- No spell ID available, try consuming any pending cast
-    local match = self:ConsumeBestCast(nil)
-    if match then
-      attributed = true
-    end
+    trace({
+      e = "UNIT_SPELLCAST_SENT",
+      unit = unit,
+      targetName = targetName,
+      castGUID = castGUID,
+      spellId = spellId,
+      context = context,
+    })
   end
 
-  if not attributed then return end
+  if unit ~= "player" then return end
 
-  -- Get the amount (may be secret)
-  local safeAmount = amount
-  if not safeAmount then return end
+  local now = GetTime()
 
-  self:Emit(eventType, safeAmount, 1, isCrit)
+  -- Record the spell for the DoT-debuff check.
+  if type(spellId) == "number" then
+    recentPlayerSpells[spellId] = now
+  end
+
+  -- Engage whichever context token actually matches the cast's target name.
+  -- Handles focus macros, mouseover casts, and cases where the same name is
+  -- on multiple nearby mobs (we trust the TOKEN's GUID, not the name).
+  if type(targetName) == "string" and targetName ~= "" then
+    for _, tok in ipairs({ "target", "focus", "mouseover" }) do
+      if safeName(tok) == targetName then
+        engageGUID(safeGUID(tok), now)
+      end
+    end
+  end
 end
+
+function Events:OnSpellcastSucceeded(_, unit, castGUID, spellId)
+  if isTraceActive() then
+    trace({
+      e = "UNIT_SPELLCAST_SUCCEEDED",
+      unit = unit,
+      castGUID = castGUID,
+      spellId = spellId,
+    })
+  end
+
+  if unit == "player" then
+    recordPlayerCast(spellId)
+  elseif unit == "pet" then
+    recordPetCast()
+  end
+end
+
+function Events:OnTargetChanged()
+  if isTraceActive() then
+    trace({
+      e = "PLAYER_TARGET_CHANGED",
+      guid = safeGUID("target"),
+      name = safeName("target"),
+    })
+  end
+end
+
+function Events:OnNameplateUnitAdded(_, unitToken)
+  if isTraceActive() then
+    trace({
+      e = "NAMEPLATE_UNIT_ADDED",
+      unit = unitToken,
+      guid = safeGUID(unitToken),
+      name = safeName(unitToken),
+    })
+  end
+end
+
+function Events:OnNameplateUnitRemoved(_, unitToken)
+  if isTraceActive() then
+    trace({
+      e = "NAMEPLATE_UNIT_REMOVED",
+      unit = unitToken,
+      guid = safeGUID(unitToken),
+      name = safeName(unitToken),
+    })
+  end
+end
+
+function Events:PollPetTarget()
+  local guid = safeGUID("pettarget")
+  if guid then
+    local now = GetTime()
+    recentPetTargets[guid] = now
+    engageGUID(guid, now)
+  end
+end
+
+-- ============================================================================
+-- Lifecycle
+-- ============================================================================
 
 function Events:OnEnable()
   self:UpdateInstanceState()
 
-  -- UNIT_COMBAT handles both incoming (player) and secondary outgoing (target)
   self:RegisterEvent("UNIT_COMBAT", "OnUnitCombat")
-
-  -- Outgoing: cast queue + COMBAT_TEXT_UPDATE correlation
   self:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED", "OnSpellcastSucceeded")
-  self:RegisterEvent("COMBAT_TEXT_UPDATE", "OnCombatTextUpdate")
-
-  -- Instance state tracking
+  self:RegisterEvent("UNIT_SPELLCAST_SENT", "OnSpellcastSent")
+  self:RegisterEvent("PLAYER_TARGET_CHANGED", "OnTargetChanged")
+  self:RegisterEvent("NAMEPLATE_UNIT_ADDED", "OnNameplateUnitAdded")
+  self:RegisterEvent("NAMEPLATE_UNIT_REMOVED", "OnNameplateUnitRemoved")
   self:RegisterEvent("PLAYER_ENTERING_WORLD", "UpdateInstanceState")
   self:RegisterEvent("ZONE_CHANGED_NEW_AREA", "UpdateInstanceState")
 
-  -- Periodic cleanup (cast queue + stale periodic spell entries)
-  self.cleanupTicker = C_Timer.NewTicker(5, function()
-    self:CleanCastQueue()
-    -- Clean stale periodic spell entries (older than 30s)
-    local now = GetTime()
-    for spellId, timestamp in pairs(recentPeriodicSpells) do
-      if (now - timestamp) > 30 then
-        recentPeriodicSpells[spellId] = nil
-      end
-    end
-  end)
+  self.sweepTicker = C_Timer.NewTicker(5, sweepAttributionState)
+  self.petTargetTicker = C_Timer.NewTicker(0.2, function() self:PollPetTarget() end)
 end
 
 function Events:OnDisable()
-  if self.cleanupTicker then
-    self.cleanupTicker:Cancel()
-    self.cleanupTicker = nil
+  if self.sweepTicker then
+    self.sweepTicker:Cancel()
+    self.sweepTicker = nil
   end
+  if self.petTargetTicker then
+    self.petTargetTicker:Cancel()
+    self.petTargetTicker = nil
+  end
+  recentPlayerSpells = {}
+  spellIdSchools = {}
+  recentPetTargets = {}
+  engaged = {}
+  lastPlayerCastSpellId = nil
+  lastPlayerCastSchool = nil
 end
