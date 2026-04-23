@@ -2,15 +2,29 @@
 set -euo pipefail
 
 # Detect WoW AddOns directory
-if [[ "$OSTYPE" == "darwin"* ]]; then
-  WOW_ADDONS="/Applications/World of Warcraft/_retail_/Interface/AddOns"
-else
-  echo "Set WOW_ADDONS env var to your WoW AddOns directory"
-  exit 1
-fi
-
 if [[ -n "${WOW_ADDONS_DIR:-}" ]]; then
   WOW_ADDONS="$WOW_ADDONS_DIR"
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+  WOW_ADDONS="/Applications/World of Warcraft/_retail_/Interface/AddOns"
+elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "win32" ]]; then
+  # Common Windows install paths (Git Bash / MSYS2)
+  for candidate in \
+    "/c/Program Files (x86)/World of Warcraft/_retail_/Interface/AddOns" \
+    "/c/Program Files/World of Warcraft/_retail_/Interface/AddOns" \
+    "/d/Games/World of Warcraft/_retail_/Interface/AddOns"; do
+    if [[ -d "$candidate" ]]; then
+      WOW_ADDONS="$candidate"
+      break
+    fi
+  done
+  if [[ -z "${WOW_ADDONS:-}" ]]; then
+    echo "Could not auto-detect WoW on Windows."
+    echo "Set WOW_ADDONS_DIR env var to your WoW AddOns directory"
+    exit 1
+  fi
+else
+  echo "Unknown OS. Set WOW_ADDONS_DIR env var to your WoW AddOns directory"
+  exit 1
 fi
 
 if [[ ! -d "$WOW_ADDONS" ]]; then
